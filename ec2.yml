@@ -1,0 +1,221 @@
+---
+- name: Create EC2 Security group
+  local_action:
+    module: ec2_group
+    name: "{{deploy_env}}-{{service}}"
+    description: "Created by Ansible"
+    vpc_id: "{{vpc_id}}"
+    region: "{{region}}"
+    rules: "{{sg_rules}}"
+    aws_access_key: "{{aws_access}}"
+    aws_secret_key: "{{aws_secret}}"
+  register: sg
+  tags:
+    - start
+    - stop
+    - restart
+    - configure
+    - starfire
+
+- name: Tag the Security Group
+  local_action:
+    module: ec2_tag
+    resource: "{{sg.group_id}}"
+    region: "{{region}}"
+    state: present
+    tags:
+      Name: "{{deploy_env}}-{{service}}"
+      Environment: "{{deploy_env}}"
+  tags:
+    - start
+    - stop
+    - restart
+    - configure
+
+- name: Find the newest Ubuntu 14.04 ami
+  ec2_ami_search:
+    distro: ubuntu
+    release: trusty
+    stream: server
+    store: ebs
+    arch: amd64
+    region: "{{region}}"
+    virt: hvm
+  register: ubuntu_image
+  tags:
+    - start
+    - stop
+    - restart
+    - configure
+    - starfire
+
+- name: Create EC2 Nodes
+  local_action: 
+    module: ec2 
+    group_id: "{{sg.group_id}}" 
+    instance_type: "{{instance_type}}" 
+    image: "{{image | default(ubuntu_image.ami)}}" 
+    wait: "yes"
+    vpc_subnet_id: "{{item.subnet}}"
+    assign_public_ip: "{{assign_public_ip}}"
+    region: "{{region}}" 
+    key_name: "{{key_name}}"
+    volumes: "{{volumes}}"
+    instance_profile_name: "{{instance_profile_name | default(omit)}}"
+    instance_tags: 
+      Name: "{{version}}-{{deploy_env}}-{{service}}-{{item.az}}-{{visibility}}"
+      version: "{{version}}" 
+      deploy_env: "{{deploy_env}}"
+      service: "{{service}}"
+      az: "{{item.az}}"
+      region: "{{region}}"
+      service_region: "{{service}}-{{region}}"
+      service_az: "{{service}}-{{item.az}}"
+    exact_count: "{{how_many}}"
+    count_tag:
+      deploy_env: "{{deploy_env}}"
+      service: "{{service}}"
+      az: "{{item.az}}"
+      region: "{{region}}"
+  with_items: subnets
+  register: ec2
+  tags:
+    - start
+    - stop
+    - restart
+    - configure
+    - starfire
+
+- name: Add new instance to host group
+  local_action: 
+    module: add_host
+    hostname: "{{item.tagged_instances[0].private_ip}}"
+    groupname: "{{service}}"
+    iid: "{{item.tagged_instances[0].id}}"
+    service: "{{service}}"
+    az: "{{item.item.az}}"
+    deploy_env: "{{deploy_env}}"
+    region: "{{region}}"
+    service_port: "{{service_port}}"
+  with_items: ec2.results
+  tags:
+    - start
+    - stop
+    - restart
+    - configure
+    - starfire
+
+- name: Wait for SSH to come up
+  local_action: 
+    module: wait_for
+    host: "{{item.tagged_instances[0].private_ip}}"
+    port: 22
+    timeout: 320
+    state: started
+  with_items: ec2.results
+  tags:
+    - start
+    - stop
+    - restart
+    - configure
+    - starfire
+
+- name: Register Instance in Route53
+  local_action:
+    module: route53
+    command: create
+    zone: "{{domain}}"
+    record: "{{region}}{{item.item.az}}-{{deploy_env}}-{{service}}.internal.{{domain}}"
+    type: A
+    ttl: 60
+    overwrite: True
+    value: "{{item.tagged_instances[0].private_ip}}"
+  with_items: ec2.results
+  tags:
+    - start
+    - restart
+    - configure
+
+- name: Register ELB DNS for non-ELB node
+  local_action:
+    module: route53
+    command: create
+    zone: "{{domain}}"
+    record: "{{region}}-{{deploy_env}}-{{service}}.{{domain}}"
+    type: A
+    ttl: 60
+    overwrite: True
+    value: "{{item.tagged_instances[0].private_ip}}"
+  with_items: ec2.results
+  when: route_around or not elb
+  tags:
+    - start
+    - restart
+    - configure
+
+- name: Register deploy_env-service dns
+  local_action:
+    module: route53
+    command: create
+    zone: "{{domain}}"
+    record: "{{deploy_env}}-{{service}}.{{domain}}"
+    type: A
+    ttl: 60
+    overwrite: True
+    value: "{{item.tagged_instances[0].private_ip}}"
+  with_items: ec2.results
+  tags:
+    - start
+    - restart
+    - configure
+
+- name: Allocate Elastic IP
+  local_action:
+    module: ec2_eip
+    in_vpc: true
+    instance_id: "{{item.tagged_instances[0].id}}"
+    region: "{{region}}"
+    reuse_existing_ip_allowed: true
+    state: present
+  with_items: ec2.results
+  when: visibility == "public" and elastic_ip
+  register: eip
+  tags:
+    - start
+    - restart
+    - configure
+
+- name: Register public DNS in Route53 (elastic ip)
+  sudo: false
+  local_action:
+    module: route53
+    command: create
+    zone: "{{domain}}"
+    record: "{{service}}.{{domain}}"
+    type: A
+    ttl: 60
+    overwrite: True
+    value: "{{item.public_ip}}"
+  with_items: eip.results
+  when: visibility == "public" and elastic_ip
+  tags:
+    - start
+    - restart
+    - configure
+
+- name: Register public DNS in Route53 (no elastic ip)
+  local_action:
+    module: route53
+    command: create
+    zone: "{{domain}}"
+    record: "{{region}}{{item.item.az}}-{{deploy_env}}-{{service}}.{{domain}}"
+    type: CNAME
+    ttl: 60
+    overwrite: True
+    value: "{{item.tagged_instances[0].public_dns_name}}"
+  with_items: ec2.results
+  when: visibility == "public" and not elastic_ip
+  tags:
+    - start
+    - restart
+    - configure
